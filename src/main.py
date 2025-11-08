@@ -22,6 +22,11 @@ from openpyxl.utils import get_column_letter
 from io import BytesIO
 from functools import wraps
 from difflib import SequenceMatcher
+import uuid
+from io import BytesIO
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24))
@@ -47,7 +52,7 @@ if PROJECT_ID:
 else:
     print("⚠ Warning: GCP_PROJECT_ID not set")
     bigquery_client = None
-
+batch_jobs = {}
 def login_required(f):
     """Decorator to require login"""
     @wraps(f)
@@ -1047,6 +1052,280 @@ def get_table_data(table_name):
 def data_explorer():
     """Serve the data explorer page"""
     return send_file('data-explorer.html')
+@app.route('/api/batch-analyze', methods=['POST'])
+@login_required
+def batch_analyze():
+    """Start batch analysis of companies from uploaded file"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file uploaded'}), 400
+        
+        file = request.files['file']
+        
+        if file.filename == '':
+            return jsonify({'success': False, 'error': 'No file selected'}), 400
+        
+        # Read the file based on extension
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(file)
+        elif file.filename.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(file)
+        else:
+            return jsonify({'success': False, 'error': 'Unsupported file type. Use CSV or Excel'}), 400
+        
+        # Validate required columns
+        required_columns = ['company_name', 'directive']
+        if not all(col in df.columns for col in required_columns):
+            return jsonify({'success': False, 'error': f'File must contain columns: {", ".join(required_columns)}'}), 400
+        
+        # Create job ID
+        job_id = str(uuid.uuid4())
+        
+        # Initialize job tracking
+        batch_jobs[job_id] = {
+            'status': 'processing',
+            'total': len(df),
+            'completed': 0,
+            'progress': 0,
+            'results': [],
+            'error': None
+        }
+        
+        # Start batch processing in background thread
+        thread = threading.Thread(
+            target=process_batch_analysis,
+            args=(job_id, df.to_dict('records'))
+        )
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'total_companies': len(df)
+        })
+        
+    except Exception as e:
+        print(f"✗ Error in batch_analyze: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+def process_batch_analysis(job_id, companies):
+    """Process batch analysis in background"""
+    try:
+        total = len(companies)
+        results = []
+        
+        for idx, company_data in enumerate(companies):
+            try:
+                company = company_data.get('company_name', '').strip()
+                directive = company_data.get('directive', '').strip()
+                
+                if not company or not directive:
+                    continue
+                
+                print(f"Batch analyzing {idx+1}/{total}: {company}")
+                
+                # Get BigQuery context
+                bq_context = get_bigquery_context(company)
+                
+                # Create prompt
+                prompt = create_enhanced_analysis_prompt(company, directive, bq_context)
+                
+                # Call Vertex AI
+                model = GenerativeModel('gemini-2.5-pro')
+                response = model.generate_content(
+                    prompt,
+                    generation_config={
+                        'temperature': 0.2,
+                        'max_output_tokens': 8000,
+                    }
+                )
+                
+                analysis_text = response.text
+                
+                # Parse structured data
+                structured_data = parse_structured_data(analysis_text)
+                
+                # Add customer match info
+                if bq_context['customer_match']:
+                    structured_data['customer_match'] = bq_context['customer_match']
+                    structured_data['existing_customer'] = True
+                    structured_data.update(bq_context['customer_data'])
+                else:
+                    structured_data['existing_customer'] = False
+                
+                # Write to BigQuery
+                analysis_record = {
+                    'company': company,
+                    'directive': directive,
+                    'prospect_level': structured_data.get('prospect_level', 'Unknown'),
+                    'prospect_score': structured_data.get('prospect_score', 0),
+                    'industry': structured_data.get('industry', 'Unknown'),
+                    'location': structured_data.get('location', 'Unknown'),
+                    'employees': structured_data.get('employees', 'Unknown'),
+                    'revenue': structured_data.get('revenue', 'Unknown'),
+                    'auditor_status': structured_data.get('auditor_status', 'Unknown'),
+                    'win_themes': structured_data.get('win_themes', 'Unknown'),
+                    'key_personnel': structured_data.get('key_personnel', 'Unknown'),
+                    'engagement_strategy': structured_data.get('engagement_strategy', 'Unknown'),
+                    'gtm_immediate': structured_data.get('gtm_immediate', 'Unknown'),
+                    'gtm_short_term': structured_data.get('gtm_short_term', 'Unknown'),
+                    'gtm_mid_term': structured_data.get('gtm_mid_term', 'Unknown'),
+                    'gtm_long_term': structured_data.get('gtm_long_term', 'Unknown'),
+                    'recommended_solutions': structured_data.get('recommended_solutions', 'Unknown'),
+                    'full_analysis': analysis_text
+                }
+                write_analysis_to_bigquery(analysis_record)
+                
+                # Add to results
+                results.append({
+                    'company': company,
+                    'directive': directive,
+                    'prospect_level': structured_data.get('prospect_level', 'Unknown'),
+                    'score': structured_data.get('prospect_score', 0),
+                    'analysis': analysis_text,
+                    'structured_data': structured_data
+                })
+                
+                # Update progress
+                batch_jobs[job_id]['completed'] = idx + 1
+                batch_jobs[job_id]['progress'] = ((idx + 1) / total) * 100
+                batch_jobs[job_id]['results'] = results
+                
+                print(f"✓ Batch analysis complete {idx+1}/{total}: {company}")
+                
+            except Exception as e:
+                print(f"✗ Error analyzing {company}: {str(e)}")
+                continue
+        
+        # Sort results by score (descending)
+        results.sort(key=lambda x: x.get('score', 0) if isinstance(x.get('score'), (int, float)) else 0, reverse=True)
+        
+        # Mark job as complete
+        batch_jobs[job_id]['status'] = 'completed'
+        batch_jobs[job_id]['results'] = results
+        batch_jobs[job_id]['progress'] = 100
+        
+        print(f"✓ Batch job {job_id} completed: {len(results)} companies analyzed")
+        
+    except Exception as e:
+        print(f"✗ Error in process_batch_analysis: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        batch_jobs[job_id]['status'] = 'failed'
+        batch_jobs[job_id]['error'] = str(e)
+
+@app.route('/api/batch-status/<job_id>', methods=['GET'])
+@login_required
+def batch_status(job_id):
+    """Get status of batch analysis job"""
+    try:
+        if job_id not in batch_jobs:
+            return jsonify({'success': False, 'error': 'Job not found'}), 404
+        
+        job = batch_jobs[job_id]
+        
+        return jsonify({
+            'success': True,
+            'status': job['status'],
+            'progress': job['progress'],
+            'completed': job['completed'],
+            'total': job['total'],
+            'results': job['results'],
+            'error': job.get('error')
+        })
+        
+    except Exception as e:
+        print(f"✗ Error in batch_status: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/export-excel', methods=['POST'])
+@login_required
+def export_excel():
+    """Export batch results to Excel"""
+    try:
+        data = request.json
+        results = data.get('results', [])
+        
+        if not results:
+            return jsonify({'success': False, 'error': 'No results to export'}), 400
+        
+        # Create Excel workbook
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Analysis Results"
+        
+        # Define headers
+        headers = [
+            'Rank', 'Company', 'Prospect Level', 'Score', 'Industry', 
+            'Location', 'Employees', 'Revenue', 'Auditor Status', 'Directive'
+        ]
+        
+        # Style for headers
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=12)
+        header_alignment = Alignment(horizontal="center", vertical="center")
+        
+        # Write headers
+        for col_num, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_alignment
+        
+        # Write data
+        for idx, result in enumerate(results, 1):
+            structured = result.get('structured_data', {})
+            
+            row_data = [
+                idx,
+                result.get('company', 'N/A'),
+                result.get('prospect_level', 'N/A'),
+                result.get('score', 'N/A'),
+                structured.get('industry', 'N/A'),
+                structured.get('location', 'N/A'),
+                structured.get('employees', 'N/A'),
+                structured.get('revenue', 'N/A'),
+                structured.get('auditor_status', 'N/A'),
+                result.get('directive', 'N/A')
+            ]
+            
+            for col_num, value in enumerate(row_data, 1):
+                cell = ws.cell(row=idx+1, column=col_num, value=value)
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+        
+        # Auto-adjust column widths
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            ws.column_dimensions[column].width = adjusted_width
+        
+        # Save to BytesIO
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f'bi_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+        )
+        
+    except Exception as e:
+        print(f"✗ Error in export_excel: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
